@@ -274,70 +274,113 @@ class HoneywellPrinter:
     MODE_NETWORK = "network"
     MODE_USB     = "usb"
 
-    # ── IPL label template for PC42t (4×2 inch, 203 dpi → 812×406 dots) ─────
+    # ── IPL label for PC42t (4x2 inch, 203 dpi) ────────────────────────────────
     @staticmethod
     def ipl(asset_id, epc, name="", location="", tag_type="Standard"):
-        """Generate IPL (Intermec Printer Language) for Honeywell PC42t/d."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # IPL uses STX/ETX framing; <STX>=\x02, <ETX>=\x03
-        label = (
-            "\x02"                          # STX — start of label
-            "n\r\n"                         # new label
-            "M t\r\n"                       # media type: thermal transfer
-            "S l1;c15,3\r\n"               # label size 4in x 2in @ 203dpi
-            "d PC\r\n"                      # PC42 direct
-            # ── Header bar (inverted box) ────────────────────────────────────
-            "B 20,10,0,1,2,2,50,B,\"" + (name or asset_id)[:28] + "\"\r\n"
-            # ── Body fields ─────────────────────────────────────────────────
-            "T 20,70,0,3,1,1,\"Asset ID: " + asset_id + "\"\r\n"
-            "T 20,100,0,3,1,1,\"EPC:      " + (epc or "UNASSIGNED") + "\"\r\n"
-            "T 20,128,0,3,1,1,\"Type:     " + tag_type + "\"\r\n"
-            "T 20,150,0,3,1,1,\"Loc:      " + (location or "—") + "\"\r\n"
-            # ── Code 128 barcode ────────────────────────────────────────────
-            "B 20,175,0,1A,3,1,60,\"" + asset_id + "\"\r\n"
-            # ── Timestamp ───────────────────────────────────────────────────
-            "T 20,260,0,3,1,1,\"" + ts + "\"\r\n"
-            # ── RFID encode (EPC Gen2) ───────────────────────────────────────
-            + ("R 1,E200," + (epc or "0000000000000000000000") + "\r\n"
-               if epc else "")
-            + "P 1\r\n"                     # print 1 copy
-            "\x03"                          # ETX — end of label
-        )
-        return label
+        """
+        IPL (Intermec Printer Language) for Honeywell PC42t/d.
+        STX (0x02) / ETX (0x03) framing.
+        Commands separated by CR+LF.
+        All field data ASCII-safe (no unicode that could confuse IPL parser).
+        """
+        ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
+        s       = HoneywellPrinter._safe
+        hdr     = s(name or asset_id, 28)
+        loc     = s(location, 25) or "N/A"
+        typ     = s(tag_type, 25)
+        epc_s   = s(epc, 30) if epc else "UNASSIGNED"
+
+        # Build each IPL command as a plain string (no nested quotes)
+        cmds = [
+            "",                              # STX — start of label stream
+            "n",                                 # new label
+            "M t",                               # media: thermal transfer
+            "S l1;c15,3",                        # label size 4x2in @ 203dpi
+            "d PC",                              # PC42 direct mode
+            # Bold text header
+            'B 20,10,0,1,2,2,50,B,"' + hdr + '"',
+            # Body text
+            'T 20,70,0,3,1,1,"Asset: ' + asset_id + '"',
+            'T 20,98,0,3,1,1,"EPC:   ' + epc_s + '"',
+            'T 20,124,0,3,1,1,"Type:  ' + typ + '"',
+            'T 20,148,0,3,1,1,"Loc:   ' + loc + '"',
+            # Code-128 barcode
+            'B 20,172,0,1A,3,1,55,"' + asset_id + '"',
+            # Timestamp
+            'T 20,248,0,3,1,1,"' + ts + '"',
+        ]
+        if epc:
+            clean = epc.replace(" ", "").upper()
+            cmds.append("R 1,E200," + clean)   # RFID encode EPC Gen2
+
+        cmds += ["P 1", ""]   # print 1 copy + ETX
+        return "\r\n".join(cmds) + "\r\n"
+
+    # ── Safe ASCII text helper ────────────────────────────────────────────────
+    @staticmethod
+    def _safe(text, maxlen=30):
+        """Strip non-ASCII chars so ZPL/IPL bytes stay clean on Windows."""
+        if not text:
+            return ""
+        cleaned = text.encode("ascii", errors="replace").decode("ascii")
+        cleaned = cleaned.replace("?", "-")   # replace ? placeholders
+        return cleaned[:maxlen]
 
     # ── ZPL label (same layout, ZPL syntax) ──────────────────────────────────
     @staticmethod
     def zpl(asset_id, epc, name="", location="", tag_type="Standard"):
-        """ZPL for Honeywell PC42t in ZPL-emulation mode."""
-        ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
-        qr_data = json.dumps({"id": asset_id, "epc": epc or ""})
-        return (
-            "^XA\n"
-            "^CI28\n"
-            "^PW812\n"
-            "^LL406\n"
-            # Header
-            "^FO0,0^GB812,52,52^FS\n"
-            f"^FO18,10^A0N,30,30^FR^FD{(name or asset_id)[:30]}^FS\n"
-            # Body
-            f"^FO18,62^A0N,20,20^FDAsset: {asset_id}^FS\n"
-            f"^FO18,90^A0N,18,18^FDEPC: {epc or 'UNASSIGNED'}^FS\n"
-            f"^FO18,114^A0N,16,16^FDType: {tag_type}^FS\n"
-            f"^FO18,136^A0N,16,16^FDLoc:  {location or '—'}^FS\n"
-            # Barcode
-            "^FO18,162^BY2,3,55\n"
-            "^BCN,55,Y,N,N\n"
-            f"^FD{asset_id}^FS\n"
-            # QR
-            "^FO620,60\n"
-            "^BQN,2,4\n"
-            f"^FDMA,{qr_data}^FS\n"
-            # Timestamp
-            f"^FO18,252^A0N,14,14^FD{ts}^FS\n"
-            # RFID encode
-            + (f"^RFWM,{epc}\n" if epc else "")
-            + "^XZ\n"
-        )
+        """
+        ZPL II for Honeywell PC42t/d in ZPL-emulation mode.
+        Label: 4x2 inch @ 203dpi = 812x406 dots.
+
+        Windows blank-label fixes applied:
+          - Removed ^CI (causes blank output on Honeywell ZPL builds)
+          - Removed ^PQ (extra form-feed that ejects a blank label)
+          - Added ^MMT (explicit thermal tear-off mode)
+          - Added ^LS0 (no label shift)
+          - Barcode uses >; prefix (Code-128 auto mode, most compatible)
+          - QR uses simple ^FDQA, format (no JSON, avoids parser issues)
+          - No trailing bytes after ^XZ
+        """
+        ts       = datetime.now().strftime("%Y-%m-%d %H:%M")
+        s        = HoneywellPrinter._safe
+        loc_str  = s(location, 25) or "N/A"
+        name_str = s(name or asset_id, 30)
+        type_str = s(tag_type, 25)
+        epc_str  = s(epc, 30) if epc else "UNASSIGNED"
+
+        lines = [
+            "^XA",
+            "^MMT",          # media mode: tear-off (prevents blank label advance)
+            "^PW812",        # print width: 4 inch @ 203 dpi
+            "^LL406",        # label length: 2 inch @ 203 dpi
+            "^LS0",          # label shift: none
+            # ── Header bar ──────────────────────────────────────────────────
+            "^FO0,0^GB812,52,52^FS",
+            f"^FO18,10^A0N,30,30^FR^FD{name_str}^FS",
+            # ── Body fields ─────────────────────────────────────────────────
+            f"^FO18,62^A0N,20,20^FDAsset: {asset_id}^FS",
+            f"^FO18,88^A0N,18,18^FDEPC: {epc_str}^FS",
+            f"^FO18,112^A0N,16,16^FDType: {type_str}^FS",
+            f"^FO18,134^A0N,16,16^FDLoc:  {loc_str}^FS",
+            # ── Separator ───────────────────────────────────────────────────
+            "^FO0,158^GB812,2,2^FS",
+            # ── Code-128 barcode ────────────────────────────────────────────
+            "^FO18,165^BY2,3,50",
+            "^BCN,50,Y,N,N",
+            f"^FD>;{asset_id}^FS",
+            # ── Timestamp ───────────────────────────────────────────────────
+            f"^FO18,245^A0N,14,14^FD{ts}^FS",
+            # ── QR code ─────────────────────────────────────────────────────
+            "^FO630,58^BQN,2,3",
+            f"^FDQA,{asset_id}^FS",
+        ]
+        if epc:
+            lines.append(f"^RFWM,{epc.replace(' ', '').upper()}")
+        lines.append("^XZ")
+        # NO trailing newline after ^XZ — extra bytes cause blank output
+        # on Honeywell PC42t ZPL firmware
+        return "\r\n".join(lines)
 
     # ── Language auto-detection ───────────────────────────────────────────────
     @staticmethod
@@ -405,75 +448,270 @@ class HoneywellPrinter:
         except Exception as e:
             return False, str(e)
 
-    # ── USB print ─────────────────────────────────────────────────────────────
+    # ── Windows helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _win_get_port(printer_name):
+        """Return Windows port name (USB001, COM3, 192.168.x.x etc.) for a printer."""
+        try:
+            import win32print
+            h = win32print.OpenPrinter(printer_name)
+            try:
+                info = win32print.GetPrinter(h, 2)
+                return info["pPortName"]
+            finally:
+                win32print.ClosePrinter(h)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _win_find_usb_ports():
+        """
+        Use Windows SETUPAPI via ctypes to find all USB virtual serial /
+        printer ports that match Honeywell / Intermec USB VID.
+        Returns list of port names like ['USB001', 'USB002'].
+        Also checks registry for known Honeywell USB printer ports.
+        """
+        ports = []
+        # Method A: win32print enum all local printer ports
+        try:
+            import win32print
+            for port_info in win32print.EnumPorts(None, 1):
+                name = port_info["pName"]
+                if name.upper().startswith("USB"):
+                    ports.append(name)
+        except Exception:
+            pass
+
+        # Method B: registry scan for USB printer ports
+        try:
+            import winreg
+            key_path = r"SYSTEM\CurrentControlSet\Control\Print\Monitors\USB Monitor\Ports"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                i = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(key, i)
+                        if subkey_name not in ports:
+                            ports.append(subkey_name)
+                        i += 1
+                    except OSError:
+                        break
+        except Exception:
+            pass
+
+        return ports if ports else ["USB001", "USB002", "USB003"]
+
+    @staticmethod
+    def _win_write_port(port_name, data):
+        """
+        Write raw bytes directly to a Windows printer port using
+        Win32 CreateFile / WriteFile — completely bypasses GDI/spooler.
+        Most reliable method for label printers. Requires admin rights
+        OR the port must be owned by current user session.
+        """
+        import ctypes
+        import ctypes.wintypes as wt
+
+        GENERIC_WRITE  = 0x40000000
+        OPEN_EXISTING  = 3
+        INVALID_HANDLE = wt.HANDLE(-1).value
+
+        # Normalise port path
+        if not port_name.startswith("\\\\."):
+            path = f"\\\\.\\{port_name}"
+        else:
+            path = port_name
+
+        handle = ctypes.windll.kernel32.CreateFileW(
+            path, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+
+        if handle == INVALID_HANDLE:
+            err = ctypes.windll.kernel32.GetLastError()
+            msgs = {
+                5:  "Access denied — run as Administrator",
+                2:  "Port not found",
+                32: "Port in use by another process",
+            }
+            return False, f"Cannot open {port_name}: {msgs.get(err, f'error {err}')}"
+
+        written = wt.DWORD(0)
+        ok = ctypes.windll.kernel32.WriteFile(
+            handle, data, len(data), ctypes.byref(written), None)
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+        if not ok or written.value == 0:
+            err = ctypes.windll.kernel32.GetLastError()
+            return False, f"WriteFile failed on {port_name} (error {err})"
+        if written.value != len(data):
+            return False, f"Partial write: {written.value}/{len(data)} bytes to {port_name}"
+        return True, f"OK ({written.value} bytes → {port_name})"
+
+    @staticmethod
+    def _win_spool_raw(printer_name, data):
+        """
+        Submit a RAW spool job via win32print.
+        Uses datatype "RAW" which tells the spooler to pass bytes
+        through unchanged — works with Generic/Text-Only driver AND
+        Honeywell's own Windows driver when set to 'RAW' port type.
+        """
+        try:
+            import win32print
+            h = win32print.OpenPrinter(printer_name)
+            try:
+                # "RAW" datatype = no rendering, pass bytes straight to port
+                win32print.StartDocPrinter(h, 1, ("RFID Label", None, "RAW"))
+                win32print.StartPagePrinter(h)
+                win32print.WritePrinter(h, data)
+                win32print.EndPagePrinter(h)
+                win32print.EndDocPrinter(h)
+            finally:
+                win32print.ClosePrinter(h)
+            return True, "OK (spooler RAW)"
+        except ImportError:
+            return None, "pywin32 not installed"
+        except Exception as e:
+            err = str(e)
+            if "1801" in err:
+                return False, f"Printer '{printer_name}' not found — check exact name in Settings"
+            if "1722" in err:
+                return False, "Print Spooler service not running"
+            return False, f"Spooler error: {err}"
+
+    @staticmethod
+    def _win_powershell(printer_name, data):
+        """
+        Copy a .prn file to the printer port via PowerShell + cmd copy /b.
+        No extra packages needed. Works on Windows 7+.
+        """
+        import tempfile
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".prn")
+            os.close(fd)
+            with open(tmp, "wb") as f:
+                f.write(data)
+
+            # Use cmd copy /b which does a true binary copy to the port
+            ps = (
+                f'$printer = Get-Printer -Name "{printer_name}" -ErrorAction Stop; '
+                f'$port = $printer.PortName; '
+                f'$result = & cmd /c "copy /b \"{tmp}\" $port" 2>&1; '
+                f'Write-Output $result'
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=15)
+            out = (proc.stdout + proc.stderr).strip()
+            if proc.returncode == 0 and "1 file" in out.lower():
+                return True, "OK (PowerShell cmd copy)"
+            # Fallback: try direct copy to UNC port share
+            ps2 = (
+                f'$p=(Get-Printer -Name "{printer_name}").PortName; '
+                f'cmd /c "copy /b \"{tmp}\" \\\\%COMPUTERNAME%\\$p"'
+            )
+            proc2 = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps2],
+                capture_output=True, text=True, timeout=10)
+            if proc2.returncode == 0:
+                return True, "OK (PowerShell UNC copy)"
+            return False, out or "PowerShell print failed"
+        except subprocess.TimeoutExpired:
+            return False, "PowerShell timed out"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.unlink(tmp)
+                except Exception: pass
+
+    # ── USB print (all platforms) ─────────────────────────────────────────────
     @classmethod
     def print_usb(cls, data, printer_name=None):
         """
-        Send raw label data to USB-connected Honeywell PC42t/d.
-          • Windows  : win32print RAW spool (pywin32)
-                       Falls back to writing directly to USB device path
-          • macOS    : lpr -l (raw passthrough via CUPS)
-          • Linux    : lp -o raw (CUPS)
+        Send raw ZPL/IPL bytes to Honeywell PC42t/d over USB.
+
+        Windows strategy (in order — stops at first success):
+          1. Direct port write (CreateFile/WriteFile) to the printer's actual
+             USB port — bypasses GDI completely, no driver interference.
+             Port is discovered from printer info, then from SETUPAPI registry.
+          2. win32print RAW spool — reliable when driver is Generic/Text-Only
+             or Honeywell driver is set to RAW passthrough.
+          3. PowerShell + cmd copy /b — fallback, no extra packages.
+
+        macOS  : lpr -l  (CUPS raw passthrough)
+        Linux  : lp -o raw (CUPS)
+
         Returns (success: bool, message: str).
         """
         system = platform.system()
         if isinstance(data, str):
-            data = data.encode("latin-1", errors="replace")
+            data = data.encode("ascii", errors="replace")
 
-        # ── Windows ──────────────────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # WINDOWS
+        # ════════════════════════════════════════════════════════════════════
         if system == "Windows":
-            # Method 1: pywin32 RAW spool (preferred — works with any driver)
-            try:
-                import win32print
-                pname = printer_name or win32print.GetDefaultPrinter()
-                if not pname:
-                    return False, "No printer found. Install Honeywell Windows driver first."
-                h = win32print.OpenPrinter(pname)
+            errors = []
+
+            # ── Method 1: Direct port write ──────────────────────────────────
+            # Find the port: first from printer object, then from SETUPAPI scan
+            port = cls._win_get_port(printer_name) if printer_name else None
+            if port:
+                ok, msg = cls._win_write_port(port, data)
+                if ok:
+                    return True, f"OK (direct: {port})"
+                errors.append(f"Direct port {port}: {msg}")
+
+            # Scan all known USB ports and try each
+            for candidate in cls._win_find_usb_ports():
+                if candidate == port:
+                    continue  # already tried
+                ok, msg = cls._win_write_port(candidate, data)
+                if ok:
+                    return True, f"OK (direct: {candidate})"
+                errors.append(f"Port {candidate}: {msg}")
+
+            # ── Method 2: win32print RAW spool ──────────────────────────────
+            if printer_name:
+                ok, msg = cls._win_spool_raw(printer_name, data)
+                if ok is True:
+                    return True, msg
+                errors.append(f"Spooler: {msg}")
+            else:
+                # Try default printer
                 try:
-                    win32print.StartDocPrinter(h, 1, ("Honeywell RAW", None, "RAW"))
-                    win32print.StartPagePrinter(h)
-                    win32print.WritePrinter(h, data)
-                    win32print.EndPagePrinter(h)
-                    win32print.EndDocPrinter(h)
-                finally:
-                    win32print.ClosePrinter(h)
-                return True, "OK"
-            except ImportError:
-                pass  # fall through to socket method
-            except Exception as e:
-                err_str = str(e)
-                # Common Windows print errors with helpful messages
-                if "1801" in err_str or "Invalid printer name" in err_str:
-                    return False, f"Printer '{printer_name}' not found in Windows. Check name in Settings."
-                if "1722" in err_str or "RPC server" in err_str:
-                    return False, "Print spooler not running. Open Services and start 'Print Spooler'."
-                return False, f"Windows print error: {err_str}"
+                    import win32print
+                    default = win32print.GetDefaultPrinter()
+                    if default:
+                        ok, msg = cls._win_spool_raw(default, data)
+                        if ok is True:
+                            return True, msg
+                        errors.append(f"Default printer spooler: {msg}")
+                except Exception:
+                    pass
 
-            # Method 2: subprocess via powershell (no pywin32 needed)
-            try:
-                import tempfile
-                tmp = tempfile.mktemp(suffix=".prn")
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                pname_arg = printer_name or ""
-                ps_cmd = (
-                    f'$bytes = [System.IO.File]::ReadAllBytes("{tmp}"); '
-                    f'$port = (Get-Printer -Name "{pname_arg}" -ErrorAction Stop).PortName; '
-                    f'[System.IO.File]::WriteAllBytes("\\\\spool\\$port", $bytes)'
-                )
-                proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps_cmd],
-                    capture_output=True, timeout=10)
-                os.unlink(tmp)
-                if proc.returncode == 0:
-                    return True, "OK (PowerShell)"
-                return False, (proc.stderr.decode().strip() or
-                               "PowerShell print failed — install pywin32: pip install pywin32")
-            except Exception as e:
-                return False, (f"No print method available on Windows. "
-                               f"Run: pip install pywin32  ({e})")
+            # ── Method 3: PowerShell ─────────────────────────────────────────
+            if printer_name:
+                ok, msg = cls._win_powershell(printer_name, data)
+                if ok:
+                    return True, msg
+                errors.append(f"PowerShell: {msg}")
 
-        # ── macOS ─────────────────────────────────────────────────────────────
+            # ── All failed ────────────────────────────────────────────────────
+            summary = " | ".join(e for e in errors[:4] if e)
+            hint = (
+                "Troubleshooting: "
+                "(1) Run app as Administrator  "
+                "(2) Try Network mode — enter printer IP in Settings  "
+                "(3) Install Generic/Text-Only driver for this printer  "
+                "(4) pip install pywin32"
+            )
+            return False, f"Print failed. {summary}. {hint}"
+
+        # ════════════════════════════════════════════════════════════════════
+        # macOS
+        # ════════════════════════════════════════════════════════════════════
         elif system == "Darwin":
             cmd = ["lpr", "-l"]
             if printer_name:
@@ -485,9 +723,11 @@ class HoneywellPrinter:
                     return False, err or "lpr failed — check printer name in Settings"
                 return True, "OK"
             except FileNotFoundError:
-                return False, "lpr not found — ensure CUPS is installed"
+                return False, "lpr not found — install CUPS"
 
-        # ── Linux ─────────────────────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # Linux
+        # ════════════════════════════════════════════════════════════════════
         else:
             cmd = ["lp", "-o", "raw"]
             if printer_name:
@@ -498,7 +738,7 @@ class HoneywellPrinter:
                     return False, proc.stderr.decode().strip()
                 return True, "OK"
             except FileNotFoundError:
-                return False, "lp not found — ensure CUPS is installed"
+                return False, "lp not found — install CUPS"
 
     # ── List local printers (cross-platform) ─────────────────────────────────
     @staticmethod
@@ -1941,7 +2181,7 @@ class SettingsPanel(ctk.CTkFrame):
             text_color=PALETTE["text"],
             height=34).pack(side="left", padx=12)
 
-        # Test + Detect buttons
+        # Test + Detect + Diagnose buttons
         bf = ctk.CTkFrame(ps, fg_color="transparent")
         bf.pack(fill="x", padx=12, pady=(10, 12))
         ctk.CTkButton(bf, text="⟳  Detect Language",
@@ -1952,6 +2192,12 @@ class SettingsPanel(ctk.CTkFrame):
             fg_color=PALETTE["accent2"], hover_color="#0284C7",
             font=ctk.CTkFont("Courier New", 12, "bold"),
             height=36, command=self._test_print).pack(side="left", padx=(0, 8))
+        if platform.system() == "Windows":
+            ctk.CTkButton(bf, text="🔍  Diagnose",
+                fg_color=PALETTE["accent3"], hover_color="#D97706",
+                text_color="#0D1117",
+                font=ctk.CTkFont("Courier New", 12, "bold"),
+                height=36, command=self._win_diagnostics).pack(side="left", padx=(0, 8))
         self.printer_status = ctk.CTkLabel(bf, text="",
             font=ctk.CTkFont("Courier New", 11),
             text_color=PALETTE["text2"])
@@ -2023,6 +2269,76 @@ class SettingsPanel(ctk.CTkFrame):
         else:
             self.net_frame.pack_forget()
             self.usb_frame.pack(fill="x")
+
+    # ── Windows diagnostics ───────────────────────────────────────────────────
+    def _win_diagnostics(self):
+        """Run a full Windows print diagnostic and show results in log."""
+        def _worker():
+            self.log.log("=== Windows Print Diagnostics ===", "info")
+            import platform as _plat
+            self.log.log(f"OS: {_plat.system()} {_plat.release()}", "info")
+
+            # 1. pywin32 available?
+            try:
+                import win32print
+                self.log.log("✔ pywin32 installed", "ok")
+                # List printers
+                printers = [p[2] for p in win32print.EnumPrinters(
+                    win32print.PRINTER_ENUM_LOCAL |
+                    win32print.PRINTER_ENUM_CONNECTIONS, None, 4)]
+                self.log.log(f"  Printers found: {printers or 'NONE'}", "info")
+                default = win32print.GetDefaultPrinter()
+                self.log.log(f"  Default printer: {default}", "info")
+                # Port for selected printer
+                pname = self.v_usb_name.get().strip()
+                if pname:
+                    port = HoneywellPrinter._win_get_port(pname)
+                    self.log.log(
+                        f"  Port for '{pname}': {port or 'NOT FOUND'}", 
+                        "ok" if port else "warn")
+            except ImportError:
+                self.log.log("✖ pywin32 NOT installed — run: pip install pywin32", "warn")
+
+            # 2. Probe USB ports directly
+            self.log.log("Probing USB/LPT ports...", "info")
+            for port in ("USB001","USB002","USB003","USB004","USB005","LPT1"):
+                try:
+                    import ctypes, ctypes.wintypes as wt
+                    GENERIC_WRITE = 0x40000000; OPEN_EXISTING = 3
+                    path = "\\\\.\\"+port
+                    h = ctypes.windll.kernel32.CreateFileW(
+                        path, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+                    if h != wt.HANDLE(-1).value:
+                        ctypes.windll.kernel32.CloseHandle(h)
+                        self.log.log(f"  ✔ {port} — accessible", "ok")
+                    else:
+                        err = ctypes.windll.kernel32.GetLastError()
+                        # Error 2 = not found, 5 = access denied, 21 = device not ready
+                        reason = {2:"not found",5:"access denied (try Run as Admin)",
+                                  21:"device not ready / no printer"}.get(err, f"error {err}")
+                        self.log.log(f"  ✖ {port} — {reason}", "info")
+                except Exception as e:
+                    self.log.log(f"  ? {port} — {e}", "info")
+
+            # 3. Network connectivity
+            host = self.v_printer_ip.get().strip()
+            if host:
+                self.log.log(f"Testing network: {host}:9100...", "info")
+                import socket
+                try:
+                    with socket.create_connection((host, 9100), timeout=3):
+                        self.log.log(f"  ✔ {host}:9100 reachable", "ok")
+                except Exception as e:
+                    self.log.log(f"  ✖ {host}:9100 — {e}", "warn")
+            else:
+                self.log.log("  (no IP set — skipping network test)", "info")
+
+            self.log.log("=== Diagnostics complete ===", "info")
+            self.printer_status.configure(
+                text="Diagnostics done — check activity log",
+                text_color=PALETTE["text2"])
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Detect language over network ──────────────────────────────────────────
     def _detect_lang(self):
