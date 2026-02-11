@@ -409,55 +409,142 @@ class HoneywellPrinter:
     @classmethod
     def print_usb(cls, data, printer_name=None):
         """
-        Send raw data to USB-connected Honeywell printer.
-        macOS / Linux: lpr/lp with -oraw flag.
-        Windows: win32print RAW spool.
+        Send raw label data to USB-connected Honeywell PC42t/d.
+          • Windows  : win32print RAW spool (pywin32)
+                       Falls back to writing directly to USB device path
+          • macOS    : lpr -l (raw passthrough via CUPS)
+          • Linux    : lp -o raw (CUPS)
         Returns (success: bool, message: str).
         """
         system = platform.system()
         if isinstance(data, str):
             data = data.encode("latin-1", errors="replace")
-        try:
-            if system == "Darwin":
-                cmd = ["lpr", "-l"]          # -l = pass through raw
-                if printer_name:
-                    cmd += ["-P", printer_name]
+
+        # ── Windows ──────────────────────────────────────────────────────────
+        if system == "Windows":
+            # Method 1: pywin32 RAW spool (preferred — works with any driver)
+            try:
+                import win32print
+                pname = printer_name or win32print.GetDefaultPrinter()
+                if not pname:
+                    return False, "No printer found. Install Honeywell Windows driver first."
+                h = win32print.OpenPrinter(pname)
+                try:
+                    win32print.StartDocPrinter(h, 1, ("Honeywell RAW", None, "RAW"))
+                    win32print.StartPagePrinter(h)
+                    win32print.WritePrinter(h, data)
+                    win32print.EndPagePrinter(h)
+                    win32print.EndDocPrinter(h)
+                finally:
+                    win32print.ClosePrinter(h)
+                return True, "OK"
+            except ImportError:
+                pass  # fall through to socket method
+            except Exception as e:
+                err_str = str(e)
+                # Common Windows print errors with helpful messages
+                if "1801" in err_str or "Invalid printer name" in err_str:
+                    return False, f"Printer '{printer_name}' not found in Windows. Check name in Settings."
+                if "1722" in err_str or "RPC server" in err_str:
+                    return False, "Print spooler not running. Open Services and start 'Print Spooler'."
+                return False, f"Windows print error: {err_str}"
+
+            # Method 2: subprocess via powershell (no pywin32 needed)
+            try:
+                import tempfile
+                tmp = tempfile.mktemp(suffix=".prn")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                pname_arg = printer_name or ""
+                ps_cmd = (
+                    f'$bytes = [System.IO.File]::ReadAllBytes("{tmp}"); '
+                    f'$port = (Get-Printer -Name "{pname_arg}" -ErrorAction Stop).PortName; '
+                    f'[System.IO.File]::WriteAllBytes("\\\\spool\\$port", $bytes)'
+                )
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True, timeout=10)
+                os.unlink(tmp)
+                if proc.returncode == 0:
+                    return True, "OK (PowerShell)"
+                return False, (proc.stderr.decode().strip() or
+                               "PowerShell print failed — install pywin32: pip install pywin32")
+            except Exception as e:
+                return False, (f"No print method available on Windows. "
+                               f"Run: pip install pywin32  ({e})")
+
+        # ── macOS ─────────────────────────────────────────────────────────────
+        elif system == "Darwin":
+            cmd = ["lpr", "-l"]
+            if printer_name:
+                cmd += ["-P", printer_name]
+            try:
                 proc = subprocess.run(cmd, input=data, capture_output=True)
                 if proc.returncode != 0:
                     err = proc.stderr.decode().strip()
-                    return False, err or "lpr failed (check printer name in Settings)"
+                    return False, err or "lpr failed — check printer name in Settings"
                 return True, "OK"
+            except FileNotFoundError:
+                return False, "lpr not found — ensure CUPS is installed"
 
-            elif system == "Windows":
-                try:
-                    import win32print
-                    pname = printer_name or win32print.GetDefaultPrinter()
-                    h = win32print.OpenPrinter(pname)
-                    try:
-                        job = win32print.StartDocPrinter(h, 1, ("RAW Label", None, "RAW"))
-                        win32print.StartPagePrinter(h)
-                        win32print.WritePrinter(h, data)
-                        win32print.EndPagePrinter(h)
-                        win32print.EndDocPrinter(h)
-                    finally:
-                        win32print.ClosePrinter(h)
-                    return True, "OK"
-                except ImportError:
-                    return False, "win32print not installed — run: pip install pywin32"
-
-            else:  # Linux
-                cmd = ["lp", "-o", "raw"]
-                if printer_name:
-                    cmd += ["-d", printer_name]
+        # ── Linux ─────────────────────────────────────────────────────────────
+        else:
+            cmd = ["lp", "-o", "raw"]
+            if printer_name:
+                cmd += ["-d", printer_name]
+            try:
                 proc = subprocess.run(cmd, input=data, capture_output=True)
                 if proc.returncode != 0:
                     return False, proc.stderr.decode().strip()
                 return True, "OK"
+            except FileNotFoundError:
+                return False, "lp not found — ensure CUPS is installed"
 
-        except FileNotFoundError:
-            return False, "lpr/lp not found — ensure CUPS is installed"
-        except Exception as e:
-            return False, str(e)
+    # ── List local printers (cross-platform) ─────────────────────────────────
+    @staticmethod
+    def list_printers():
+        """
+        Return list of printer names available on this system.
+        Windows: via win32print or PowerShell.
+        macOS/Linux: via lpstat.
+        """
+        system = platform.system()
+        printers = []
+        if system == "Windows":
+            try:
+                import win32print
+                printers = [p[2] for p in win32print.EnumPrinters(
+                    win32print.PRINTER_ENUM_LOCAL |
+                    win32print.PRINTER_ENUM_CONNECTIONS, None, 4)]
+            except ImportError:
+                try:
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-Printer | Select-Object -ExpandProperty Name"],
+                        capture_output=True, text=True, timeout=8)
+                    printers = [l.strip() for l in result.stdout.splitlines()
+                                if l.strip()]
+                except Exception:
+                    pass
+        elif system == "Darwin":
+            try:
+                result = subprocess.run(["lpstat", "-p"], capture_output=True,
+                                        text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    if line.startswith("printer "):
+                        printers.append(line.split()[1])
+            except Exception:
+                pass
+        else:  # Linux
+            try:
+                result = subprocess.run(["lpstat", "-p"], capture_output=True,
+                                        text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    if line.startswith("printer "):
+                        printers.append(line.split()[1])
+            except Exception:
+                pass
+        return printers
 
     # ── High-level unified print ──────────────────────────────────────────────
     @classmethod
@@ -1772,8 +1859,50 @@ class SettingsPanel(ctk.CTkFrame):
         self.usb_frame.grid_columnconfigure(1, weight=1)
         self.v_usb_name = tk.StringVar(
             value=self.db.get_setting("printer_usb_name") or "")
-        row(self.usb_frame, "macOS Printer Name", self.v_usb_name,
-            "Name from System Settings → Printers")
+
+        # Printer name row with auto-discover button
+        uf = ctk.CTkFrame(self.usb_frame, fg_color="transparent")
+        uf.pack(fill="x", padx=12, pady=3)
+        uf.grid_columnconfigure(1, weight=1)
+        _os_hint = ("Devices & Printers" if platform.system() == "Windows"
+                    else "System Settings → Printers")
+        ctk.CTkLabel(uf, text="Printer Name",
+            font=ctk.CTkFont("Courier New", 11),
+            text_color=PALETTE["text2"],
+            width=170, anchor="e").grid(row=0, column=0, padx=(0,10))
+        self.usb_name_entry = ctk.CTkEntry(uf, textvariable=self.v_usb_name,
+            placeholder_text=f"e.g. Honeywell PC42t  ({_os_hint})",
+            font=ctk.CTkFont("Courier New", 12),
+            fg_color=PALETTE["bg3"],
+            border_color=PALETTE["border"],
+            text_color=PALETTE["text"],
+            height=34)
+        self.usb_name_entry.grid(row=0, column=1, sticky="ew")
+        ctk.CTkButton(uf, text="⟳ Discover",
+            fg_color=PALETTE["bg3"], hover_color=PALETTE["border"],
+            font=ctk.CTkFont("Courier New", 11, "bold"),
+            width=90, height=34,
+            command=self._discover_printers).grid(row=0, column=2, padx=(6,0))
+
+        # Printer dropdown (populated by Discover)
+        self.v_printer_choice = tk.StringVar(value="")
+        self.printer_dropdown = ctk.CTkOptionMenu(self.usb_frame,
+            values=["Click ⟳ Discover to list printers"],
+            variable=self.v_printer_choice,
+            fg_color=PALETTE["bg3"],
+            button_color=PALETTE["accent"],
+            dropdown_fg_color=PALETTE["bg2"],
+            font=ctk.CTkFont("Courier New", 11),
+            command=self._on_printer_selected)
+        self.printer_dropdown.pack(fill="x", padx=12, pady=(0,4))
+
+        # Windows-specific hint
+        if platform.system() == "Windows":
+            ctk.CTkLabel(self.usb_frame,
+                text="  💡 Windows: requires Honeywell driver + pywin32  "
+                     "(pip install pywin32)",
+                font=ctk.CTkFont("Courier New", 10),
+                text_color=PALETTE["text3"]).pack(anchor="w", padx=12, pady=(0,4))
 
         # Language
         lf = ctk.CTkFrame(ps, fg_color="transparent")
@@ -1973,18 +2102,57 @@ class SettingsPanel(ctk.CTkFrame):
                 self.log.log(f"Test print failed: {msg}", "error")
         threading.Thread(target=_worker, daemon=True).start()
 
+    # ── Printer discovery ─────────────────────────────────────────────────────
+    def _discover_printers(self):
+        """List all printers on this system and populate the dropdown."""
+        self.printer_status.configure(
+            text="Discovering printers…", text_color=PALETTE["text2"])
+        def _worker():
+            printers = HoneywellPrinter.list_printers()
+            if printers:
+                self.printer_dropdown.configure(values=printers)
+                # Auto-select if only one, or if name contains "Honeywell"/"PC42"
+                best = next(
+                    (p for p in printers
+                     if any(k in p.lower() for k in ("honeywell","pc42","pc42t","pc42d"))),
+                    printers[0])
+                self.v_printer_choice.set(best)
+                self.v_usb_name.set(best)
+                self.printer_status.configure(
+                    text=f"✔ Found {len(printers)} printer(s)",
+                    text_color=PALETTE["success"])
+                self.log.log(
+                    f"Printers found: {', '.join(printers)}", "ok")
+            else:
+                self.printer_dropdown.configure(
+                    values=["No printers found"])
+                self.printer_status.configure(
+                    text="⚠ No printers found — check driver/connection",
+                    text_color=PALETTE["warning"])
+                self.log.log(
+                    "No printers discovered. On Windows install Honeywell "
+                    "driver; on macOS/Linux ensure CUPS is running.", "warn")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_printer_selected(self, choice):
+        """Fill name entry when user picks from dropdown."""
+        if choice and not choice.startswith("Click") and not choice.startswith("No "):
+            self.v_usb_name.set(choice)
+
     # ── Save ──────────────────────────────────────────────────────────────────
     def _save(self):
-        self.db.set_setting("print_mode",      self.v_print_mode.get())
-        self.db.set_setting("printer_ip",      self.v_printer_ip.get().strip())
-        self.db.set_setting("printer_port",    self.v_printer_port.get().strip() or "9100")
-        self.db.set_setting("printer_usb_name",self.v_usb_name.get().strip())
-        self.db.set_setting("printer_lang",    self.v_lang.get())
-        self.db.set_setting("printer_copies",  self.v_copies.get().strip() or "1")
-        self.db.set_setting("id_prefix",       self.v_prefix.get().strip())
-        self.db.set_setting("id_counter",      self.v_counter.get().strip())
-        self.db.set_setting("export_dir",      self.v_export.get().strip())
-        self.log.log("Settings saved", "ok")
+        self.db.set_setting("print_mode",       self.v_print_mode.get())
+        self.db.set_setting("printer_ip",       self.v_printer_ip.get().strip())
+        self.db.set_setting("printer_port",     self.v_printer_port.get().strip() or "9100")
+        self.db.set_setting("printer_usb_name", self.v_usb_name.get().strip())
+        self.db.set_setting("printer_lang",     self.v_lang.get())
+        self.db.set_setting("printer_copies",   self.v_copies.get().strip() or "1")
+        self.db.set_setting("id_prefix",        self.v_prefix.get().strip())
+        self.db.set_setting("id_counter",       self.v_counter.get().strip())
+        self.db.set_setting("export_dir",       self.v_export.get().strip())
+        self.log.log(
+            f"Settings saved — mode: {self.v_print_mode.get()}  "
+            f"lang: {self.v_lang.get()}", "ok")
 
 
 # ─── Main Application Window ───────────────────────────────────────────────────
