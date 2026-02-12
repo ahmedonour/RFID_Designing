@@ -2203,6 +2203,38 @@ class SettingsPanel(ctk.CTkFrame):
             text_color=PALETTE["text2"])
         self.printer_status.pack(side="left", padx=8)
 
+        # Windows blank-label warning + fix tools
+        if platform.system() == "Windows":
+            wf = ctk.CTkFrame(ps, fg_color="#1C1008",
+                              corner_radius=6, border_color=PALETTE["warning"],
+                              border_width=1)
+            wf.pack(fill="x", padx=12, pady=(0, 8))
+            ctk.CTkLabel(wf,
+                text="  ⚠  Windows: if labels print blank, the driver is converting "
+                     "ZPL/IPL to GDI. Use the tools below to fix it.",
+                font=ctk.CTkFont("Courier New", 10),
+                text_color=PALETTE["warning"],
+                wraplength=500, anchor="w", justify="left"
+            ).pack(fill="x", padx=8, pady=(6, 2))
+            bf3 = ctk.CTkFrame(wf, fg_color="transparent")
+            bf3.pack(fill="x", padx=8, pady=(2, 8))
+            ctk.CTkButton(bf3, text="🔧 Fix: Install Generic Driver",
+                fg_color=PALETTE["warning"], hover_color="#D97706",
+                text_color="#0D1117",
+                font=ctk.CTkFont("Courier New", 10, "bold"),
+                height=28, command=self._fix_driver
+            ).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(bf3, text="📋 Copy Test ZPL",
+                fg_color=PALETTE["bg3"], hover_color=PALETTE["border"],
+                font=ctk.CTkFont("Courier New", 10, "bold"),
+                height=28, command=self._copy_zpl_test
+            ).pack(side="left", padx=(0, 6))
+            ctk.CTkLabel(bf3,
+                text="← recommended fix",
+                font=ctk.CTkFont("Courier New", 9),
+                text_color=PALETTE["text3"]
+            ).pack(side="left")
+
         # ══════════════════════════════════════════════════════════════════════
         # 2. ASSET ID
         # ══════════════════════════════════════════════════════════════════════
@@ -2469,6 +2501,108 @@ class SettingsPanel(ctk.CTkFrame):
         self.log.log(
             f"Settings saved — mode: {self.v_print_mode.get()}  "
             f"lang: {self.v_lang.get()}", "ok")
+
+
+    # ── Windows: blank-label diagnostic ──────────────────────────────────────
+    def _win_diagnostics(self):
+        """Launch the standalone Windows print diagnostic script."""
+        import importlib.util, threading
+
+        # Find the diagnostic script next to the main app
+        app_dir     = os.path.dirname(os.path.abspath(__file__))
+        diag_script = os.path.join(app_dir, "win_print_debug.py")
+
+        if not os.path.exists(diag_script):
+            self.printer_status.configure(
+                text="⚠ win_print_debug.py not found — place it next to rfid_manager.py",
+                text_color=PALETTE["warning"])
+            self.log.log("Diagnostic script not found: " + diag_script, "warn")
+            return
+
+        self.log.log("Launching Windows print diagnostic…", "info")
+        try:
+            # Open in a new console window so output is visible
+            subprocess.Popen(
+                ["python", diag_script],
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+            self.printer_status.configure(
+                text="✔ Diagnostic window opened",
+                text_color=PALETTE["success"])
+        except Exception as e:
+            self.log.log(f"Could not launch diagnostic: {e}", "error")
+
+    # ── Windows: install Generic/Text-Only driver ─────────────────────────────
+    def _fix_driver(self):
+        """
+        Open Windows Add Printer Wizard pre-targeted at Generic/Text Only.
+        This is the correct driver for Honeywell label printers on Windows
+        because it passes raw ZPL/IPL bytes through unchanged.
+        """
+        if platform.system() != "Windows":
+            return
+        self.log.log("Opening Windows Add Printer Wizard…", "info")
+
+        # Strategy 1: Open existing printer's driver dialog
+        pname = self.v_usb_name.get().strip()
+        if pname:
+            try:
+                subprocess.Popen([
+                    "rundll32.exe", "printui.dll,PrintUIEntry",
+                    "/Xg", "/n", pname  # open printer driver properties
+                ])
+                self._show_driver_instructions()
+                return
+            except Exception:
+                pass
+
+        # Strategy 2: Open Devices and Printers
+        try:
+            subprocess.Popen(["control.exe", "printers"])
+            self._show_driver_instructions()
+        except Exception as e:
+            self.log.log(f"Could not open printer settings: {e}", "error")
+
+    def _show_driver_instructions(self):
+        """Show a popup with exact steps to install Generic/Text Only driver."""
+        import tkinter.messagebox as mb
+        mb.showinfo(
+            "Fix Blank Labels — Install Generic Driver",
+            "Follow these steps to fix blank labels on Windows:\n\n"
+            "1. In the Devices and Printers window that just opened,\n"
+            "   right-click your Honeywell PC42t printer\n\n"
+            "2. Click 'Printer properties' → 'Advanced' tab\n\n"
+            "3. Click 'New Driver...' → Next\n\n"
+            "4. Manufacturer = 'Generic'\n"
+            "   Printer = 'Generic / Text Only'\n"
+            "   Click Next → Finish\n\n"
+            "5. Back in app: click 'Test Print'\n\n"
+            "WHY: Honeywell's own Windows driver converts ZPL to GDI\n"
+            "     before printing, stripping all label content.\n"
+            "     Generic/Text Only passes the raw bytes straight through."
+        )
+
+    # ── Copy minimal ZPL to clipboard for manual testing ─────────────────────
+    def _copy_zpl_test(self):
+        """Copy a minimal test ZPL string to clipboard for manual verification."""
+        test_zpl = (
+            "^XA\r\n"
+            "^MMT\r\n"
+            "^PW812\r\n"
+            "^LL406\r\n"
+            "^FO50,50^A0N,40,40^FDHoneywell Test^FS\r\n"
+            "^FO50,110^A0N,30,30^FDPC42t Windows^FS\r\n"
+            "^XZ"
+        )
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(test_zpl)
+            self.printer_status.configure(
+                text="✔ ZPL copied — paste into Notepad and print RAW to test",
+                text_color=PALETTE["success"])
+            self.log.log("Minimal ZPL copied to clipboard", "ok")
+        except Exception as e:
+            self.log.log(f"Clipboard error: {e}", "error")
 
 
 # ─── Main Application Window ───────────────────────────────────────────────────
