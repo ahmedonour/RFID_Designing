@@ -26,11 +26,26 @@ from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib import colors as rl_colors
 
 # ─── Try importing RFIDIOt (gracefully degrade if not installed) ─────────────
+# Auto-load path written by install_rfidiot.py
+_rfidiot_path_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "rfidiot_path.txt")
+if os.path.exists(_rfidiot_path_file):
+    with open(_rfidiot_path_file) as _f:
+        for _p in _f.read().splitlines():
+            _p = _p.strip()
+            if _p and _p not in sys.path:
+                sys.path.insert(0, _p)
+
+RFID_AVAILABLE = False
 try:
-    import RFIDIOt as rfid
+    import rfidiot as rfid
     RFID_AVAILABLE = True
 except ImportError:
-    RFID_AVAILABLE = False
+    try:
+        import RFIDIOt as rfid
+        RFID_AVAILABLE = True
+    except ImportError:
+        RFID_AVAILABLE = False
 
 # ─── App-wide constants ───────────────────────────────────────────────────────
 APP_TITLE    = "RFID Asset Manager"
